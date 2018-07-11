@@ -103,6 +103,8 @@ struct sipp_option {
 #define SIPP_OPTION_LFOVERWRITE   37
 #define SIPP_OPTION_PLUGIN        38
 #define SIPP_OPTION_NEED_SCTP     39
+#define SIPP_OPTION_RX_SCENARIO   40
+#define SIPP_OPTION_RX_INPUT_FILE 41
 #define SIPP_HELP_TEXT_HEADER    255
 
 /* Put each option, its help text, and type in this table. */
@@ -113,7 +115,9 @@ struct sipp_option options_table[] = {
     {"", "Scenario file options:", SIPP_HELP_TEXT_HEADER, NULL, 0},
     {"sd", "Dumps a default scenario (embedded in the SIPp executable)", SIPP_OPTION_SCENARIO, NULL, 0},
     {"sf", "Loads an alternate XML scenario file.  To learn more about XML scenario syntax, use the -sd option to dump embedded scenarios. They contain all the necessary help.", SIPP_OPTION_SCENARIO, NULL, 2},
+    {"rxsf", "Loads an alternate receive xml scenario file as the second scenario - enabling a mixture of originating and terminating calls to be executed. If this is included then the second scenario MUST be a server mode scenario, and the first scenario (specified in -sf / -sn) MUST be a client-mode scenario. If both -snrx and -sfrx are ommitted then only a single scenario is executed.\n", SIPP_OPTION_RX_SCENARIO, NULL, 2},
     {"oocsf", "Load out-of-call scenario.", SIPP_OPTION_OOC_SCENARIO, NULL, 2},
+    {"rxrn", "Use a default scenario (embedded in the sipp executable) for the second scenario - enabling a mixture of originating and terminating calls to be executed. If this is included then the second scenario MUST be a server mode scenario, and the first scenario (specified in -sf / -sn) MUST be a client-mode scenario. If both -snrx and -sfrx are ommitted then only a single scenario is executed.\n",SIPP_OPTION_RX_SCENARIO, NULL, 2},
     {"oocsn", "Load out-of-call scenario.", SIPP_OPTION_OOC_SCENARIO, NULL, 2},
     {
         "sn", "Use a default scenario (embedded in the SIPp executable). If this option is omitted, the Standard SipStone UAC scenario is loaded.\n"
@@ -151,6 +155,9 @@ struct sipp_option options_table[] = {
         , SIPP_OPTION_TRANSPORT, NULL, 1
     },
     {"i", "Set the local IP address for 'Contact:','Via:', and 'From:' headers. Default is primary host IP address.\n", SIPP_OPTION_IP, local_ip, 1},
+    {"rxinf", "Inject values from an external CSV file during calls into the scenarios.\n"
+     "First line of this file say whether the data is to be read in sequence (SEQUENTIAL), random (RANDOM), or user (USER) order.\n"
+     "Each line corresponds to one call and has one or more ';' delimited data fields. Those fields can be referred as [field0], [field1], ... in the xml scenario file.  Several CSV files can be used simultaneously (syntax: -inf f1.csv -inf f2.csv ...)", SIPP_OPTION_RX_INPUT_FILE, NULL, 1},
     {"p", "Set the local port number.  Default is a random free port chosen by the system.", SIPP_OPTION_INT, &user_port, 1},
     {"bind_local", "Bind socket to local IP address, i.e. the local IP address is used as the source IP address.  If SIPp runs in server mode it will only listen on the local IP address instead of all IP addresses.", SIPP_OPTION_SETFLAG, &bind_local, 1},
     {"ci", "Set the local control IP address", SIPP_OPTION_IP, control_ip, 1},
@@ -484,17 +491,21 @@ static void traffic_thread()
             (*(sockets_pending_reset.begin()))->reset_connection();
             sockets_pending_reset.erase(sockets_pending_reset.begin());
         }
-
         if ((main_scenario->stats->GetStat(CStat::CPT_C_IncomingCallCreated) + main_scenario->stats->GetStat(CStat::CPT_C_OutgoingCallCreated)) >= stop_after) {
             quitting = 1;
+        }
+        if (rx_scenario) {
+            if ((rx_scenario->stats->GetStat(CStat::CPT_C_IncomingCallCreated) + rx_scenario->stats->GetStat(CStat::CPT_C_OutgoingCallCreated)) >= stop_after) {
+                quitting = 2;
+            }
         }
         if (quitting) {
             if (quitting > 11) {
                 /* Force exit: abort all calls */
                 abort_all_tasks();
             }
-            /* Quitting and no more opened calls, close all */
-            if (!main_scenario->stats->GetStat(CStat::CPT_C_CurrentCall)) {
+            /* Quitting and no more openned calls, close all */
+            if (!main_scenario->stats->GetStat(CStat::CPT_C_CurrentCall) || (quitting == 2 && !rx_scenario->stats->GetStat(CStat::CPT_C_CurrentCall))) {
                 /* We can have calls that do not count towards our open-call count (e.g., dead calls). */
                 abort_all_tasks();
 #ifdef RTP_STREAM
@@ -911,6 +922,27 @@ static void stop_all_traces()
     dumpInFile = 0;
 }
 
+
+char* remove_pattern(char* P_buffer, char* P_extensionPattern) {
+
+  char *L_ptr = P_buffer;
+
+  if (P_extensionPattern == NULL) {
+    return P_buffer ;
+  }
+
+  if (P_buffer == NULL) {
+    return P_buffer ;
+  }
+
+  L_ptr = strstr(P_buffer, P_extensionPattern) ;
+  if (L_ptr != NULL) {
+    *L_ptr = '\0' ;
+  }
+
+  return P_buffer ;
+}
+
 static void freeInFiles()
 {
     for (file_map::iterator file_it = inFiles.begin(); file_it != inFiles.end(); file_it++) {
@@ -1004,6 +1036,10 @@ void sipp_exit(int rc)
     if (display_scenario) {
         counter_value_failed = display_scenario->stats->GetStat(CStat::CPT_C_FailedCall);
         counter_value_success = display_scenario->stats->GetStat(CStat::CPT_C_SuccessfulCall);
+        if(rx_scenario){
+            counter_value_failed += rx_scenario->stats->GetStat(CStat::CPT_C_FailedCall);
+            counter_value_success += rx_scenario->stats->GetStat(CStat::CPT_C_SuccessfulCall);
+        }
     } else {
         rc = EXIT_TEST_FAILED;
     }
@@ -1367,6 +1403,28 @@ int main(int argc, char *argv[])
                 }
             }
             break;
+            case SIPP_OPTION_RX_INPUT_FILE:
+                {
+                    REQUIRE_ARG();
+                    CHECK_PASS();
+                    FileContents *rxData = new FileContents(argv[argi]);
+                    char *name = argv[argi];
+                    if (strrchr(name, '/')) {
+                        name = strrchr(name, '/') + 1;
+                    } else if (strrchr(name, '\\')) {
+                        name = strrchr(name, '\\') + 1;
+                    }
+                    assert(name);
+                    inFiles[name] = rxData;
+                    /* By default, the first file is used for IP address input. */
+                    if (!rx_ip_file) {
+                        rx_ip_file = name;
+                    }
+                    if (!rx_default_file) {
+                        rx_default_file = name;
+                    }
+                }
+            break;
             case SIPP_OPTION_INDEX_FILE:
                 REQUIRE_ARG();
                 REQUIRE_ARG();
@@ -1564,6 +1622,26 @@ int main(int argc, char *argv[])
                     ERROR("Internal error, I don't recognize %s as a scenario option\n", argv[argi] - 1);
                 }
                 break;
+                case SIPP_OPTION_RX_SCENARIO:
+                    REQUIRE_ARG();
+                    CHECK_PASS();
+                    creationMode=MODE_MIXED;
+                    if (!strcmp(argv[argi - 1], "-rxsf")) {
+                        rx_scenario_file = new char [strlen(argv[argi])+1] ;
+                        sprintf(rx_scenario_file,"%s", argv[argi]);
+                        rx_scenario_file = remove_pattern (rx_scenario_file, (char*)".xml");
+                        rx_scenario = new scenario(argv[argi], 0);
+                        rx_scenario->stats->setFileName(rx_scenario_file, (char*)".csv");
+                    } else if (!strcmp(argv[argi - 1], "-rxsn")) {
+                        int i = find_scenario(argv[argi]);
+                        rx_scenario = new scenario(0, i);
+                        rx_scenario_file = new char [strlen(argv[argi])+1] ;
+                        sprintf(rx_scenario_file,"%s", argv[argi]);
+                        rx_scenario->stats->setFileName(argv[argi], (char*)".csv");
+                    } else {
+                        ERROR("Internal error, I don't recognize %s as a scenario option\n", argv[argi] - 1);
+                    }
+                    break;
             case SIPP_OPTION_OOC_SCENARIO:
                 REQUIRE_ARG();
                 CHECK_PASS();
@@ -1967,7 +2045,7 @@ int main(int argc, char *argv[])
 
     /* Setting the rate and its dependant params (open_calls_allowed) */
     /* If we are a client, then create the task to open new calls. */
-    if (creationMode == MODE_CLIENT) {
+    if ((creationMode == MODE_CLIENT) || ((creationMode == MODE_MIXED) and (display_scenario==main_scenario))){
         CallGenerationTask::initialize();
         CallGenerationTask::set_rate(rate);
     }
